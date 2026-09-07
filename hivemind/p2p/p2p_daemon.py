@@ -1,35 +1,32 @@
 import asyncio
-import json
-import logging
 import os
-import platform
 import secrets
+import threading
 import warnings
 from collections.abc import AsyncIterable as AsyncIterableABC
 from contextlib import closing, suppress
 from dataclasses import dataclass
-from datetime import datetime
-from importlib.resources import files
-from typing import Any, AsyncIterator, Awaitable, Callable, List, Optional, Sequence, Tuple, Type, TypeVar, Union
+from typing import AsyncIterator, Awaitable, Callable, List, Optional, Sequence, Tuple, Type, TypeVar, Union
 
 from google.protobuf.message import Message
 
-import hivemind.hivemind_cli as cli
-import hivemind.p2p.p2p_daemon_bindings.p2pclient as p2pclient
+from hivemind.p2p.p2p_native import (  # noqa: E402 - first: installs crypto_pb2 alias
+    TrioGateway,
+    hivemind_id_to_libp2p,
+    hivemind_maddr_to_libp2p,
+    libp2p_id_to_hivemind,
+    libp2p_maddr_to_hivemind,
+)
 from hivemind.p2p.p2p_daemon_bindings.control import DEFAULT_MAX_MSG_SIZE, P2PDaemonError, P2PHandlerError
 from hivemind.p2p.p2p_daemon_bindings.datastructures import PeerID, PeerInfo, StreamInfo
-from hivemind.p2p.p2p_daemon_bindings.utils import ControlFailure
 from hivemind.proto import crypto_pb2
 from hivemind.proto.p2pd_pb2 import RPCError
-from hivemind.utils.asyncio import as_aiter, asingle, cancel_task_if_running
+from hivemind.utils.asyncio import as_aiter, asingle
 from hivemind.utils.crypto import RSAPrivateKey
-from hivemind.utils.logging import get_logger, golog_level_to_python, loglevel, python_level_to_golog
+from hivemind.utils.logging import get_logger
 from hivemind.utils.multiaddr import Multiaddr
 
 logger = get_logger(__name__)
-
-
-P2PD_FILENAME = "p2pd"
 
 
 @dataclass(frozen=True)
@@ -39,20 +36,27 @@ class P2PContext:
     remote_id: PeerID = None
 
 
+# Maps daemon listen tokens (opaque in-process identifiers) to shared gateways.
+# Replaces the old "connect to an already running p2pd" mechanism.
+_SHARED_GATEWAYS: dict = {}
+
+
+def _proto(name: str) -> str:
+    """Single wire namespace for unary, streaming and raw binary handlers.
+
+    Mirrors the Go daemon, where ``add_unary_handler`` and ``stream_handler``
+    share one name registry.
+    """
+    return name if name.startswith("/") else f"/hivemind/{name}"
+
+
 class P2P:
     """
-    This class is responsible for establishing peer-to-peer connections through NAT and/or firewalls.
-    It creates and manages a libp2p daemon (https://libp2p.io) in a background process,
-    then terminates it when P2P is shut down. In order to communicate, a P2P instance should
-    either use one or more initial_peers that will connect it to the rest of the swarm or
-    use the public IPFS network (https://ipfs.io).
+    Native py-libp2p peer (pure Python, no Go daemon).
 
-    For incoming connections, P2P instances add RPC handlers that may be accessed by other peers:
-      - `P2P.add_protobuf_handler` accepts a protobuf message and returns another protobuf
-      - `P2P.add_binary_stream_handler` transfers raw data using bi-directional streaming interface
-
-    To access these handlers, a P2P instance can `P2P.call_protobuf_handler`/`P2P.call_binary_stream_handler`,
-    using the recipient's unique `P2P.peer_id` and the name of the corresponding handler.
+    Runs an in-process libp2p host on a dedicated trio thread (see
+    :mod:`hivemind.p2p.p2p_native`) while exposing the same asyncio API that
+    higher Hivemind layers (DHT, averaging, MoE) already use.
     """
 
     HEADER_LEN = 8
@@ -74,11 +78,11 @@ class P2P:
 
     def __init__(self):
         self.peer_id = None
-        self._client = None
-        self._child = None
+        self._gateway: Optional[TrioGateway] = None
+        self._daemon_listen_maddr = None
+        self._visible_maddrs: List[Multiaddr] = []
         self._alive = False
-        self._reader_task = None
-        self._listen_task = None
+        self._stream_handlers: dict = {}
 
     @classmethod
     async def create(
@@ -109,46 +113,18 @@ class P2P:
         trusted_relays: Optional[Sequence[Union[Multiaddr, str]]] = None,
     ) -> "P2P":
         """
-        Start a new p2pd process and connect to it.
-        :param initial_peers: List of bootstrap peers
-        :param auto_nat: Enables the AutoNAT service
-        :param announce_maddrs: Visible multiaddrs that the peer will announce
-                                for external connections from other p2p instances
-        :param conn_manager: Enables the Connection Manager
-        :param dht_mode: libp2p DHT mode (auto/client/server).
-                         Defaults to "server" to make collaborations work in local networks.
-                         Details: https://pkg.go.dev/github.com/libp2p/go-libp2p-kad-dht#ModeOpt
-        :param force_reachability: Force reachability mode (public/private)
-        :param host_maddrs: Multiaddrs to listen for external connections from other p2p instances
-        :param identity_path: Path to a private key file. If defined, makes the peer ID deterministic.
-                              If the file does not exist yet, writes a new private key to this file.
-        :param idle_timeout: kill daemon if client has been idle for a given number of
-                             seconds before opening persistent streams
-        :param nat_port_map: Enables NAT port mapping
-        :param relay_hop_limit: sets the hop limit for hop relays
-        :param startup_timeout: raise a P2PDaemonError if the daemon does not start in ``startup_timeout`` seconds
-        :param tls: Enables TLS1.3 channel security protocol
-        :param use_ipfs: Bootstrap to IPFS (incompatible with initial_peers)
-        :param use_relay: Enable circuit relay functionality in libp2p
-                          (see https://docs.libp2p.io/concepts/nat/circuit-relay/).
-                          If enabled (default), you can reach peers behind NATs/firewalls through libp2p relays.
-                          If you are behind NAT/firewall yourself,
-                          please pass `use_auto_relay=True` to become reachable.
-        :param use_auto_relay: Look for libp2p relays to become reachable if we are behind NAT/firewall
-        :param quic: Deprecated, has no effect since libp2p 0.17.0
-        :param use_relay_hop: Deprecated, has no effect since libp2p 0.17.0
-        :param use_relay_discovery: Deprecated, has no effect since libp2p 0.17.0
-        :param check_if_identity_free: If enabled (default), ``identity_path`` is provided,
-                                       and we are connecting to an existing swarm,
-                                       ensure that this identity is not used by other peers already.
-                                       This slows down ``P2P.create()`` but protects from unintuitive libp2p errors
-                                       appearing in case of the identity collision.
-        :return: a wrapper for the p2p daemon
-        """
+        Start an in-process native py-libp2p host and connect to the swarm.
 
+        Daemon-only transport flags (``auto_nat``, ``conn_manager``, ``use_relay``,
+        ``nat_port_map``, ...) are accepted for signature compatibility and wired
+        up in later phases (Rendezvous / NAT traversal); they currently have no
+        effect beyond being validated.
+        """
         assert not (initial_peers and use_ipfs), (
             "User-defined initial_peers and use_ipfs=True are incompatible, please choose one option"
         )
+        if use_ipfs:
+            raise P2PDaemonError("use_ipfs is not supported by the native py-libp2p backend")
 
         if not all(arg is None for arg in [quic, use_relay_hop, use_relay_discovery]):
             warnings.warn(
@@ -157,139 +133,92 @@ class P2P:
                 DeprecationWarning,
                 stacklevel=2,
             )
+        if dht_mode not in cls.DHT_MODE_MAPPING:
+            raise ValueError(f"Unknown dht_mode {dht_mode!r}, expected one of {sorted(cls.DHT_MODE_MAPPING)}")
+        if force_reachability is not None and force_reachability not in cls.FORCE_REACHABILITY_MAPPING:
+            raise ValueError(f"Unknown force_reachability {force_reachability!r}")
 
         self = cls()
-        p2pd_path = files(cli).joinpath(P2PD_FILENAME)
-
-        socket_uid = secrets.token_urlsafe(8)
-        self._daemon_listen_maddr = Multiaddr(cls._UNIX_SOCKET_PREFIX + f"p2pd-{socket_uid}.sock")
-        self._client_listen_maddr = Multiaddr(cls._UNIX_SOCKET_PREFIX + f"p2pclient-{socket_uid}.sock")
         if announce_maddrs is not None:
             for addr in announce_maddrs:
                 addr = Multiaddr(addr)
                 if ("tcp" in addr and addr["tcp"] == "0") or ("udp" in addr and addr["udp"] == "0"):
                     raise ValueError("Please specify an explicit port in announce_maddrs: port 0 is not supported")
 
-        need_bootstrap = bool(initial_peers) or use_ipfs
-        process_kwargs = cls.DHT_MODE_MAPPING[dht_mode].copy()
-        process_kwargs.update(cls.FORCE_REACHABILITY_MAPPING.get(force_reachability, {}))
-        for param, value in [
-            ("bootstrapPeers", initial_peers),
-            ("hostAddrs", host_maddrs),
-            ("announceAddrs", announce_maddrs),
-            ("trustedRelays", trusted_relays),
-        ]:
-            if value:
-                process_kwargs[param] = self._maddrs_to_str(value)
-        if no_listen:
-            process_kwargs["noListenAddrs"] = 1
+        key_pair = None
         if identity_path is not None:
             if os.path.isfile(identity_path):
-                if check_if_identity_free and need_bootstrap:
+                if check_if_identity_free and initial_peers:
                     logger.info(f"Checking that identity from `{identity_path}` is not used by other peers")
-                    if await cls.is_identity_taken(
-                        identity_path,
-                        initial_peers=initial_peers,
-                        tls=tls,
-                        use_auto_relay=use_auto_relay,
-                        use_ipfs=use_ipfs,
-                        use_relay=use_relay,
-                    ):
+                    if await cls.is_identity_taken(identity_path, initial_peers=initial_peers):
                         raise P2PDaemonError(f"Identity from `{identity_path}` is already taken by another peer")
             else:
                 logger.info(f"Generating new identity to be saved in `{identity_path}`")
                 self.generate_identity(identity_path)
-                # A newly generated identity is not taken with ~100% probability
-            process_kwargs["id"] = identity_path
+            key_pair = cls._load_keypair(identity_path)
 
-        proc_args = self._make_process_args(
-            str(p2pd_path),
-            autoRelay=use_auto_relay,
-            autonat=auto_nat,
-            b=need_bootstrap,
-            connManager=conn_manager,
-            idleTimeout=f"{idle_timeout}s",
-            listen=self._daemon_listen_maddr,
-            natPortMap=nat_port_map,
-            relay=use_relay,
-            relayHopLimit=relay_hop_limit,
-            tls=tls,
-            persistentConnMaxMsgSize=persistent_conn_max_msg_size,
-            **process_kwargs,
-        )
+        listen_maddrs = [] if no_listen else [str(a) for a in (host_maddrs or [])]
+        gateway = TrioGateway(key_pair=key_pair, listen_maddrs=listen_maddrs)
+        gateway.attach_loop(asyncio.get_running_loop())
+        gateway.retain()
+        self._gateway = gateway
 
-        env = os.environ.copy()
-        env.setdefault("GOLOG_LOG_LEVEL", python_level_to_golog(loglevel))
-        env["GOLOG_LOG_FMT"] = "json"
+        token_uid = secrets.token_urlsafe(8)
+        self._daemon_listen_maddr = Multiaddr(cls._UNIX_SOCKET_PREFIX + f"native-{token_uid}.sock")
+        _SHARED_GATEWAYS[str(self._daemon_listen_maddr)] = gateway
 
-        logger.debug(f"Launching {proc_args}")
-        try:
-            self._child = await asyncio.subprocess.create_subprocess_exec(
-                *proc_args, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT, env=env
-            )
-        except FileNotFoundError:
-            raise P2PDaemonError(
-                f"p2pd binary not found at {proc_args[0]}. "
-                f"This may indicate a failed installation. "
-                f"Try reinstalling with: HIVEMIND_BUILDGO=1 pip install -e ."
-            )
-        except OSError as e:
-            if "Exec format error" in str(e) or "cannot execute binary file" in str(e):
-                raise P2PDaemonError(
-                    f"p2pd binary format incompatible with your platform ({platform.system()}/{platform.machine()}). "
-                    f"The binary may be corrupted or for the wrong architecture. "
-                    f"Reinstall with: HIVEMIND_BUILDGO=1 pip install -e ."
-                )
-            else:
-                raise P2PDaemonError(f"Failed to start p2pd daemon: {e}")
+        lib_id = await gateway.run(gateway._get_id)
+        self.peer_id = libp2p_id_to_hivemind(lib_id)
+
+        if announce_maddrs is not None:
+            self._visible_maddrs = [Multiaddr(a) for a in announce_maddrs]
+        else:
+            raw = await gateway.run(gateway._get_addrs)
+            self._visible_maddrs = [libp2p_maddr_to_hivemind(a) for a in raw]
+        p2p_suffix = Multiaddr(f"/p2p/{self.peer_id.to_base58()}")
+        self._visible_maddrs = [a.encapsulate(p2p_suffix) if "p2p" not in a else a for a in self._visible_maddrs]
+
         self._alive = True
+        logger.debug(f"Launched native py-libp2p host with peer id = {self.peer_id}")
 
-        ready = asyncio.Future()
-        self._reader_task = asyncio.create_task(self._read_outputs(ready))
-        try:
-            await asyncio.wait_for(ready, startup_timeout)
-        except asyncio.TimeoutError:
-            await self.shutdown()
-            raise P2PDaemonError(f"Daemon failed to start in {startup_timeout:.1f} seconds")
-
-        self._client = await p2pclient.Client.create(
-            control_maddr=self._daemon_listen_maddr,
-            listen_maddr=self._client_listen_maddr,
-            persistent_conn_max_msg_size=persistent_conn_max_msg_size,
-        )
-
-        await self._ping_daemon()
+        if initial_peers:
+            for addr in initial_peers:
+                with suppress(Exception):
+                    await self._connect_to_maddr(Multiaddr(addr))
         return self
+
+    @staticmethod
+    def _load_keypair(identity_path: str):
+        from Crypto.PublicKey import RSA
+
+        from libp2p.crypto.keys import KeyPair
+        from libp2p.crypto.rsa import RSAPrivateKey as LibRSAPrivateKey
+
+        with open(identity_path, "rb") as f:
+            protobuf = crypto_pb2.PrivateKey.FromString(f.read())
+        if protobuf.key_type != crypto_pb2.RSA:
+            raise P2PDaemonError(f"Unsupported key type in `{identity_path}` (native backend supports RSA)")
+        impl = RSA.import_key(protobuf.data)
+        private = LibRSAPrivateKey(impl)
+        return KeyPair(private_key=private, public_key=private.get_public_key())
 
     @classmethod
     async def is_identity_taken(
-        cls,
-        identity_path: str,
-        *,
-        initial_peers: Optional[Sequence[Union[Multiaddr, str]]],
-        tls: bool,
-        use_auto_relay: bool,
-        use_ipfs: bool,
-        use_relay: bool,
+        cls, identity_path: str, *, initial_peers: Optional[Sequence[Union[Multiaddr, str]]] = None, **kwargs
     ) -> bool:
         with open(identity_path, "rb") as f:
             peer_id = PeerID.from_identity(f.read())
 
-        anonymous_p2p = await cls.create(
-            initial_peers=initial_peers,
-            dht_mode="client",
-            tls=tls,
-            use_auto_relay=use_auto_relay,
-            use_ipfs=use_ipfs,
-            use_relay=use_relay,
-        )
+        anonymous = await cls.create(initial_peers=initial_peers, check_if_identity_free=False)
         try:
-            await anonymous_p2p._client.connect(peer_id, [])
-            return True
-        except ControlFailure:
+            for _ in range(50):
+                peers = await anonymous.list_peers()
+                if any(p.peer_id == peer_id for p in peers):
+                    return True
+                await asyncio.sleep(0.1)
             return False
         finally:
-            await anonymous_p2p.shutdown()
+            await anonymous.shutdown()
 
     @staticmethod
     def generate_identity(identity_path: str) -> None:
@@ -308,61 +237,93 @@ class P2P:
     @classmethod
     async def replicate(cls, daemon_listen_maddr: Multiaddr) -> "P2P":
         """
-        Connect to existing p2p daemon
-        :param daemon_listen_maddr: multiaddr of the existing p2p daemon
-        :return: new wrapper for the existing p2p daemon
+        Attach to an existing in-process native host.
+
+        :param daemon_listen_maddr: token returned as ``P2P.daemon_listen_maddr``
+               by another native ``P2P`` instance in this process.
         """
+        gateway = _SHARED_GATEWAYS.get(str(daemon_listen_maddr))
+        if gateway is None:
+            raise P2PDaemonError(f"No native py-libp2p host found for {daemon_listen_maddr}")
 
         self = cls()
-        # There is no child under control
-        # Use external already running p2pd
-        self._child = None
+        gateway.attach_loop(asyncio.get_running_loop())
+        gateway.retain()
+        self._gateway = gateway
+        self._daemon_listen_maddr = Multiaddr(daemon_listen_maddr)
+
+        lib_id = await gateway.run(gateway._get_id)
+        self.peer_id = libp2p_id_to_hivemind(lib_id)
+        raw = await gateway.run(gateway._get_addrs)
+        p2p_suffix = Multiaddr(f"/p2p/{self.peer_id.to_base58()}")
+        self._visible_maddrs = []
+        for a in raw:
+            ha = libp2p_maddr_to_hivemind(a)
+            self._visible_maddrs.append(ha.encapsulate(p2p_suffix) if "p2p" not in ha else ha)
         self._alive = True
-
-        socket_uid = secrets.token_urlsafe(8)
-        self._daemon_listen_maddr = daemon_listen_maddr
-        self._client_listen_maddr = Multiaddr(cls._UNIX_SOCKET_PREFIX + f"p2pclient-{socket_uid}.sock")
-
-        self._client = await p2pclient.Client.create(self._daemon_listen_maddr, self._client_listen_maddr)
-
-        await self._ping_daemon()
         return self
 
-    async def _ping_daemon(self) -> None:
-        self.peer_id, self._visible_maddrs = await self._client.identify()
-        logger.debug(f"Launched p2pd with peer id = {self.peer_id}, host multiaddrs = {self._visible_maddrs}")
+    async def _connect_to_maddr(self, addr: Multiaddr) -> None:
+        from libp2p.peer.peerinfo import PeerInfo as LibPeerInfo
 
-    async def get_visible_maddrs(self, latest: bool = False) -> List[Multiaddr]:
-        """
-        Get multiaddrs of the current peer that should be accessible by other peers.
+        addr_str = str(addr)
+        if "/p2p/" not in addr_str:
+            raise P2PDaemonError(f"Cannot connect to {addr_str}: missing /p2p/ peer ID component")
+        base, b58 = addr_str.rsplit("/p2p/", 1)
+        lib_id = hivemind_id_to_libp2p(PeerID.from_base58(b58))
+        lib_addr = hivemind_maddr_to_libp2p(Multiaddr(base))
+        try:
+            await self._gateway.run(self._gateway._connect, LibPeerInfo(lib_id, [lib_addr]))
+            await self._gateway.run(self._gateway._note_addrs, lib_id, [str(lib_addr)])
+        except Exception as e:  # noqa: BLE001 - best effort bootstrap
+            logger.warning(f"Failed to connect to bootstrap peer {addr_str}: {e}")
 
-        :param latest: ask the P2P daemon to refresh the visible multiaddrs
-        """
+    async def _ensure_connected(self, peer_id: PeerID) -> None:
+        peers = await self.list_peers()
+        if any(p.peer_id == peer_id for p in peers):
+            return
+        # Fall back to peerstore addresses (populated via identify on prior contact)
+        from libp2p.peer.peerinfo import PeerInfo as LibPeerInfo
 
-        if latest:
-            _, self._visible_maddrs = await self._client.identify()
+        lib_id = hivemind_id_to_libp2p(peer_id)
 
-        if not self._visible_maddrs:
-            raise ValueError(f"No multiaddrs found for peer {self.peer_id}")
+        async def _connect_known() -> None:
+            addrs = await self._gateway.run(self._gateway._peer_addrs, lib_id)
+            if not addrs:
+                raise P2PDaemonError(f"Not connected to peer {peer_id.to_base58()} and no known addresses")
+            await self._gateway.run(self._gateway._connect, LibPeerInfo(lib_id, addrs))
 
-        p2p_maddr = Multiaddr(f"/p2p/{self.peer_id.to_base58()}")
-        return [addr.encapsulate(p2p_maddr) for addr in self._visible_maddrs]
-
-    async def list_peers(self) -> List[PeerInfo]:
-        return list(await self._client.list_peers())
-
-    async def wait_for_at_least_n_peers(self, n_peers: int, attempts: int = 3, delay: float = 1) -> None:
-        for _ in range(attempts):
-            peers = await self._client.list_peers()
-            if len(peers) >= n_peers:
-                return
-            await asyncio.sleep(delay)
-
-        raise RuntimeError("Not enough peers")
+        await _connect_known()
 
     @property
     def daemon_listen_maddr(self) -> Multiaddr:
         return self._daemon_listen_maddr
+
+    async def get_visible_maddrs(self, latest: bool = False) -> List[Multiaddr]:
+        if not self._visible_maddrs:
+            raise ValueError(f"No multiaddrs found for peer {self.peer_id}")
+        return list(self._visible_maddrs)
+
+    async def list_peers(self) -> List[PeerInfo]:
+        gateway = self._gateway
+        lib_ids = await gateway.run(gateway._connected_peers)
+        peers = []
+        for lib_id in lib_ids:
+            raw_addrs = await gateway.run(gateway._peer_addrs, lib_id)
+            peers.append(
+                PeerInfo(
+                    libp2p_id_to_hivemind(lib_id),
+                    [libp2p_maddr_to_hivemind(a) for a in raw_addrs],
+                )
+            )
+        return peers
+
+    async def wait_for_at_least_n_peers(self, n_peers: int, attempts: int = 3, delay: float = 1) -> None:
+        for _ in range(attempts):
+            if len(await self.list_peers()) >= n_peers:
+                return
+            await asyncio.sleep(delay)
+        raise RuntimeError("Not enough peers")
 
     @staticmethod
     async def send_raw_data(data: bytes, writer: asyncio.StreamWriter, *, chunk_size: int = 2**16) -> None:
@@ -417,14 +378,6 @@ class P2P:
         max_prefetch: int = 5,
         balanced: bool = False,
     ) -> None:
-        """
-        :param max_prefetch: Maximum number of items to prefetch from the request stream.
-          ``max_prefetch <= 0`` means unlimited.
-
-        :note:  Since the cancel messages are sent via the input stream,
-          they will not be received while the prefetch buffer is full.
-        """
-
         async def _handle_stream(
             stream_info: StreamInfo, reader: asyncio.StreamReader, writer: asyncio.StreamWriter
         ) -> None:
@@ -448,14 +401,11 @@ class P2P:
                         try:
                             await P2P.send_protobuf(response, writer)
                         except Exception:
-                            # The connection is unexpectedly closed by the caller or broken.
-                            # The loglevel is DEBUG since the actual error will be reported on the caller
                             logger.debug("Exception while sending response:", exc_info=True)
                             break
                 except Exception as e:
                     logger.warning("Handler failed with the exception:", exc_info=True)
                     with suppress(Exception):
-                        # Sometimes `e` is a connection error, so it is okay if we fail to report `e` to the caller
                         await P2P.send_protobuf(RPCError(message=str(e)), writer)
 
             with closing(writer):
@@ -480,7 +430,7 @@ class P2P:
                 finally:
                     processing_task.cancel()
 
-        await self.add_binary_stream_handler(name, _handle_stream, balanced=balanced)
+        await self.add_binary_stream_handler(_proto(name), _handle_stream)
 
     async def _iterate_protobuf_stream_handler(
         self, peer_id: PeerID, name: str, requests: TInputStream, output_protobuf_type: Type[Message]
@@ -488,9 +438,12 @@ class P2P:
         _, reader, writer = await self.call_binary_stream_handler(peer_id, name)
 
         async def _write_to_stream() -> None:
-            async for request in requests:
-                await P2P.send_protobuf(request, writer)
-            await P2P.send_protobuf(P2P.END_OF_STREAM, writer)
+            try:
+                async for request in requests:
+                    await P2P.send_protobuf(request, writer)
+                await P2P.send_protobuf(P2P.END_OF_STREAM, writer)
+            except (ConnectionResetError, BrokenPipeError):
+                pass
 
         async def _read_from_stream() -> AsyncIterator[Message]:
             with closing(writer):
@@ -498,7 +451,7 @@ class P2P:
                     while True:
                         try:
                             response, err = await P2P.receive_protobuf(output_protobuf_type, reader)
-                        except asyncio.IncompleteReadError:  # Connection is closed
+                        except asyncio.IncompleteReadError:
                             break
 
                         if err is not None:
@@ -524,19 +477,9 @@ class P2P:
         stream_output: bool = False,
         balanced: bool = False,
     ) -> None:
-        """
-        :param stream_input: If True, assume ``handler`` to take ``TInputStream``
-                             (not just ``TInputProtobuf``) as input.
-        :param stream_output: If True, assume ``handler`` to return ``TOutputStream``
-                              (not ``Awaitable[TOutputProtobuf]``).
-        :param balanced: If True, handler will be balanced on p2pd side between all handlers in python.
-                         Default: False
-        """
-
-        if not stream_input and not stream_output:
-            await self._add_protobuf_unary_handler(name, handler, input_protobuf_type, balanced=balanced)
-            return
-
+        # Like the Go daemon, unary and streaming handlers share one namespace:
+        # every protobuf handler is served by the streaming engine, with unary
+        # calls mapped onto a single request/response exchange.
         async def _stream_handler(requests: P2P.TInputStream, context: P2PContext) -> P2P.TOutputStream:
             input = requests if stream_input else await asingle(requests)
             output = handler(input, context)
@@ -556,40 +499,7 @@ class P2P:
         stream_input: bool = False,
         stream_output: bool = False,
     ) -> None:
-        if not stream_input and not stream_output:
-            await self._client.remove_unary_handler(name)
-            return
-
-        await self.remove_binary_stream_handler(name)
-
-    async def _add_protobuf_unary_handler(
-        self,
-        handle_name: str,
-        handler: Callable[[TInputProtobuf, P2PContext], Awaitable[TOutputProtobuf]],
-        input_protobuf_type: Type[Message],
-        balanced: bool = False,
-    ) -> None:
-        """
-        Register a request-response (unary) handler. Unary requests and responses
-        are sent through persistent multiplexed connections to the daemon for the
-        sake of reducing the number of open files.
-        :param handle_name: name of the handler (protocol id)
-        :param handler: function handling the unary requests
-        :param input_protobuf_type: protobuf type of the request
-        """
-
-        async def _unary_handler(request: bytes, remote_id: PeerID) -> bytes:
-            input_serialized = input_protobuf_type.FromString(request)
-            context = P2PContext(
-                handle_name=handle_name,
-                local_id=self.peer_id,
-                remote_id=remote_id,
-            )
-
-            response = await handler(input_serialized, context)
-            return response.SerializeToString()
-
-        await self._client.add_unary_handler(handle_name, _unary_handler, balanced=balanced)
+        await self.remove_binary_stream_handler(_proto(name))
 
     async def call_protobuf_handler(
         self,
@@ -611,9 +521,25 @@ class P2P:
         input: TInputProtobuf,
         output_protobuf_type: Type[Message],
     ) -> Awaitable[TOutputProtobuf]:
-        serialized_input = input.SerializeToString()
-        response = await self._client.call_unary_handler(peer_id, handle_name, serialized_input)
-        return output_protobuf_type.FromString(response)
+        if peer_id == self.peer_id:
+            raise P2PDaemonError("Cannot dial self")
+        await self._ensure_connected(peer_id)
+        _, reader, writer = await self.call_binary_stream_handler(peer_id, _proto(handle_name))
+        with closing(writer):
+            try:
+                await P2P.send_protobuf(input, writer)
+                # Terminate the request stream so the server's single-request
+                # adapter (asingle) completes after exactly one item.
+                await P2P.send_protobuf(P2P.END_OF_STREAM, writer)
+                response, err = await P2P.receive_protobuf(output_protobuf_type, reader)
+            except asyncio.CancelledError:
+                writer.close()
+                raise
+        if err is not None:
+            raise P2PHandlerError(f"Failed to call handler `{handle_name}` at {peer_id}: {err.message}")
+        if response is None:
+            raise P2PDaemonError(f"No response from handler `{handle_name}` at {peer_id}")
+        return response
 
     async def iterate_protobuf_handler(
         self,
@@ -622,128 +548,156 @@ class P2P:
         input: Union[TInputProtobuf, TInputStream],
         output_protobuf_type: Type[Message],
     ) -> TOutputStream:
+        if peer_id == self.peer_id:
+            raise P2PDaemonError("Cannot dial self")
+        await self._ensure_connected(peer_id)
         requests = input if isinstance(input, AsyncIterableABC) else as_aiter(input)
         return await self._iterate_protobuf_stream_handler(peer_id, name, requests, output_protobuf_type)
 
-    def _start_listening(self) -> None:
-        async def listen() -> None:
-            async with self._client.listen():
-                await asyncio.Future()  # Wait until this task will be cancelled in _terminate()
-
-        self._listen_task = asyncio.create_task(listen())
-
     async def add_binary_stream_handler(
-        self, name: str, handler: p2pclient.StreamHandler, balanced: bool = False
+        self, name: str, handler, balanced: bool = False
     ) -> None:
-        if self._listen_task is None:
-            self._start_listening()
-        await self._client.stream_handler(name, handler, balanced)
+        name = _proto(name)
+        gateway = self._gateway
+        if gateway is None:
+            raise P2PDaemonError("P2P instance is shut down")
+        if name in gateway._handlers or name in self._stream_handlers:
+            raise P2PDaemonError(f"Handler `{name}` is already registered")
+        loop = asyncio.get_running_loop()
+        self._stream_handlers[name] = handler
+
+        async def _trio_on_stream(stream) -> None:
+            try:
+                remote_lib_id = stream.muxed_conn.peer_id
+            except Exception:  # noqa: BLE001 - defensive
+                remote_lib_id = None
+            try:
+                remote = libp2p_id_to_hivemind(remote_lib_id) if remote_lib_id is not None else self.peer_id
+            except Exception:  # noqa: BLE001 - defensive
+                remote = self.peer_id
+            info = StreamInfo(peer_id=remote, addr=Multiaddr("/ip4/127.0.0.1/tcp/0"), proto=name)
+            reader, writer, out_queue, session_id = gateway.open_pipe(loop=loop)
+            closed = threading.Event()
+            setattr(reader, "_native_stream_closed", closed)  # noqa: B010 - bridge bookkeeping
+
+            async def _consume() -> None:
+                try:
+                    await handler(info, reader, writer)
+                except asyncio.CancelledError:
+                    raise
+                except Exception:  # noqa: BLE001 - user handler errors are logged
+                    logger.warning("Binary stream handler failed:", exc_info=True)
+                finally:
+                    with suppress(Exception):
+                        writer.close()
+
+            consumer = asyncio.run_coroutine_threadsafe(_consume(), loop)
+            try:
+                await gateway._serve_stream(stream, reader, out_queue, session_id)
+            finally:
+                closed.set()
+                if not consumer.done():
+                    consumer.cancel()
+
+        async def _set() -> None:
+            await gateway._set_handler(name, _trio_on_stream)
+
+        await gateway.run(_set)
 
     async def remove_binary_stream_handler(self, name: str) -> None:
-        await self._client.remove_stream_handler(name)
+        if name not in self._stream_handlers:
+            raise P2PDaemonError(f"Handler `{name}` is not registered")
+        del self._stream_handlers[name]
+        gateway = self._gateway
+
+        async def _remove() -> None:
+            await gateway._remove_handler(name)
+
+        await gateway.run(_remove)
 
     async def call_binary_stream_handler(
         self, peer_id: PeerID, handler_name: str
     ) -> Tuple[StreamInfo, asyncio.StreamReader, asyncio.StreamWriter]:
-        return await self._client.stream_open(peer_id, (handler_name,))
+        if peer_id == self.peer_id:
+            raise P2PDaemonError("Cannot dial self")
+        await self._ensure_connected(peer_id)
+        gateway = self._gateway
+        handler_name = _proto(handler_name)
+        stream = await self._open_binary_stream(peer_id, handler_name)
+        reader, writer, out_queue, session_id = gateway.open_pipe()
+        closed = threading.Event()
+        setattr(reader, "_native_stream_closed", closed)  # noqa: B010 - bridge bookkeeping
+
+        async def _serve() -> None:
+            await gateway._serve_stream(stream, reader, out_queue, session_id)
+            closed.set()
+
+        await gateway.spawn(_serve)
+        info = StreamInfo(peer_id=peer_id, addr=Multiaddr("/ip4/127.0.0.1/tcp/0"), proto=handler_name)
+        return info, reader, writer
+
+    async def _reconnect(self, peer_id: PeerID) -> None:
+        """Drop stale connection state and reconnect via peerstore addresses."""
+        from libp2p.peer.peerinfo import PeerInfo as LibPeerInfo
+
+        lib_id = hivemind_id_to_libp2p(peer_id)
+        addrs = await self._gateway.run(self._gateway._peer_addrs, lib_id)
+        if not addrs:
+            raise P2PDaemonError(f"Not connected to peer {peer_id.to_base58()} and no known addresses")
+        await self._gateway.run(self._gateway._disconnect, lib_id)
+        await self._gateway.run(self._gateway._connect, LibPeerInfo(lib_id, addrs))
+
+    async def _open_binary_stream(self, peer_id: PeerID, handler_name: str):
+        gateway = self._gateway
+        lib_id = hivemind_id_to_libp2p(peer_id)
+
+        async def _open():
+            try:
+                return await gateway._new_stream(lib_id, [handler_name])
+            except Exception as e:  # noqa: BLE001 - e.g. handler removed: mirror daemon errors
+                raise P2PDaemonError(f"Failed to open stream for `{handler_name}` at {peer_id}: {e}") from e
+
+        try:
+            return await gateway.run(_open)
+        except P2PDaemonError as open_error:
+            # The cached connection may be stale (e.g. closed after a failed
+            # negotiation): reconnect once and retry before giving up.
+            try:
+                await self._reconnect(peer_id)
+            except P2PDaemonError:
+                raise open_error from None
+            try:
+                return await gateway.run(_open)
+            except P2PDaemonError:
+                raise
+            except Exception as e:  # noqa: BLE001 - bridge failures surface as daemon errors
+                raise P2PDaemonError(f"Failed to open stream for `{handler_name}` at {peer_id}: {e}") from e
+        except Exception as e:  # noqa: BLE001 - bridge failures surface as daemon errors
+            raise P2PDaemonError(f"Failed to open stream for `{handler_name}` at {peer_id}: {e}") from e
 
     def __del__(self):
-        self._terminate()
+        try:
+            self._terminate()
+        except Exception:  # noqa: BLE001 - never raise from __del__
+            pass
 
     @property
     def is_alive(self) -> bool:
         return self._alive
 
     async def shutdown(self) -> None:
+        for name in list(self._stream_handlers):
+            with suppress(Exception):
+                await self.remove_binary_stream_handler(name)
         self._terminate()
-        if self._child is not None:
-            await self._child.wait()
+        await asyncio.sleep(0)
 
     def _terminate(self) -> None:
-        if self._client is not None:
-            self._client.close()
-        if self._listen_task is not None:
-            cancel_task_if_running(self._listen_task)
-        if self._reader_task is not None:
-            cancel_task_if_running(self._reader_task)
-
-        self._alive = False
-        if self._child is not None and self._child.returncode is None:
-            with suppress(ProcessLookupError):
-                self._child.terminate()
-                logger.debug(f"Terminated p2pd with id = {self.peer_id}")
-
-            with suppress(FileNotFoundError, TypeError):
-                os.remove(self._daemon_listen_maddr["unix"])
-        with suppress(FileNotFoundError, TypeError):
-            os.remove(self._client_listen_maddr["unix"])
-
-    @staticmethod
-    def _make_process_args(*args, **kwargs) -> List[str]:
-        proc_args = []
-        proc_args.extend(str(entry) for entry in args)
-        proc_args.extend(
-            f"-{key}={P2P._convert_process_arg_type(value)}" if value is not None else f"-{key}"
-            for key, value in kwargs.items()
-        )
-        return proc_args
-
-    @staticmethod
-    def _convert_process_arg_type(val: Any) -> Any:
-        if isinstance(val, bool):
-            return int(val)
-        return val
-
-    @staticmethod
-    def _maddrs_to_str(maddrs: List[Multiaddr]) -> str:
-        return ",".join(str(addr) for addr in maddrs)
-
-    async def _read_outputs(self, ready: asyncio.Future) -> None:
-        last_line = None
-        while True:
-            line = await self._child.stdout.readline()
-            if not line:  # Stream closed
-                break
-            last_line = line.rstrip().decode(errors="ignore")
-
-            self._log_p2pd_message(last_line)
-            if last_line.startswith("Peer ID:"):
-                ready.set_result(None)
-
-        if not ready.done():
-            ready.set_exception(P2PDaemonError(f"Daemon failed to start: {last_line}"))
-
-    @staticmethod
-    def _log_p2pd_message(line: str) -> None:
-        if '"logger"' not in line:  # User-friendly info from p2pd stdout
-            logger.debug(line, extra={"caller": "p2pd"})
+        if not self._alive:
             return
-
-        try:
-            record = json.loads(line)
-            caller = record["caller"]
-
-            level = golog_level_to_python(record["level"])
-            if level <= logging.WARNING:
-                # Many Go loggers are excessively verbose (e.g. show warnings for unreachable peers),
-                # so we downgrade INFO and WARNING messages to DEBUG.
-                # The Go verbosity can still be controlled via the GOLOG_LOG_LEVEL env variable.
-                # Details: https://github.com/ipfs/go-log#golog_log_level
-                level = logging.DEBUG
-
-            message = record["msg"]
-            if "error" in record:
-                message += f": {record['error']}"
-
-            logger.log(
-                level,
-                message,
-                extra={
-                    "origin_created": datetime.strptime(record["ts"], "%Y-%m-%dT%H:%M:%S.%f%z").timestamp(),
-                    "caller": caller,
-                },
-            )
-        except Exception:
-            # Parsing errors are unlikely, but we don't want to lose these messages anyway
-            logger.warning(line, extra={"caller": "p2pd"})
-            logger.exception("Failed to parse go-log message:")
+        self._alive = False
+        gateway = self._gateway
+        self._gateway = None
+        if gateway is not None:
+            _SHARED_GATEWAYS.pop(str(self._daemon_listen_maddr), None)
+            gateway.release()
