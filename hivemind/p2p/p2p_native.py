@@ -148,6 +148,8 @@ class TrioGateway:
         # redial working for previously seen peers (e.g. DHT routing entries).
         self._known_addrs: Dict[str, List[str]] = {}
         self._rendezvous_service = None
+        self._relay_protocol = None
+        self._relay_transport = None
         self._refcount = 0
         self._lock = threading.Lock()
         self._loop: Optional[asyncio.AbstractEventLoop] = None
@@ -424,6 +426,163 @@ class TrioGateway:
             await self._close_stream(stream)
             if on_done is not None:
                 on_done()
+
+    # -- circuit relay v2 (trio side) ----------------------------------------
+    async def _relay_setup(self, allow_hop: bool) -> None:
+        """Enable relay roles on this host (idempotent; upgrade-only)."""
+        from libp2p.relay.circuit_v2.config import RelayConfig, RelayRole
+        from libp2p.relay.circuit_v2.protocol import (
+            PROTOCOL_ID as RELAY_PROTOCOL_ID,
+        )
+        from libp2p.relay.circuit_v2.protocol import (
+            STOP_PROTOCOL_ID as RELAY_STOP_ID,
+        )
+        from libp2p.relay.circuit_v2.protocol import CircuitV2Protocol
+        from libp2p.relay.circuit_v2.transport import CircuitV2Transport
+
+        if self._relay_transport is not None:
+            if allow_hop and not self._relay_protocol.allow_hop:
+                self._relay_protocol.allow_hop = True
+            return
+        roles = (RelayRole.HOP | RelayRole.STOP | RelayRole.CLIENT) if allow_hop \
+            else (RelayRole.STOP | RelayRole.CLIENT)
+        config = RelayConfig(roles=roles)
+        protocol = CircuitV2Protocol(self._host, None, allow_hop=allow_hop)
+        self._relay_transport = CircuitV2Transport(self._host, protocol, config)
+        self._host.set_stream_handler(RELAY_PROTOCOL_ID, protocol._handle_hop_stream)
+        self._host.set_stream_handler(RELAY_STOP_ID, protocol._handle_stop_stream)
+        self._relay_protocol = protocol
+
+    async def _relay_has_reservation(self, peer_id) -> bool:
+        if self._relay_protocol is None:
+            return False
+        try:
+            return bool(self._relay_protocol.resource_manager.has_reservation(peer_id))
+        except Exception:  # noqa: BLE001
+            return False
+
+    async def _relay_reserve(self, relay_lib_id) -> str:
+        """Reserve a relay slot; returns our relay address via this relay."""
+        from libp2p.peer.peerstore import env_to_send_in_RPC
+        from libp2p.relay.circuit_v2.pb.circuit_pb2 import HopMessage
+        from libp2p.relay.circuit_v2.protocol import PROTOCOL_ID as RELAY_PROTOCOL_ID
+
+        if self._relay_transport is None:
+            await self._relay_setup(allow_hop=False)
+        stream = await self._host.new_stream(relay_lib_id, [RELAY_PROTOCOL_ID])
+        try:
+            envelope_bytes, _ = env_to_send_in_RPC(self._host)
+            msg = HopMessage(
+                type=HopMessage.RESERVE,
+                peer=self._host.get_id().to_bytes(),
+                senderRecord=envelope_bytes,
+            )
+            await stream.write(msg.SerializeToString())
+            with trio.fail_after(15):
+                resp_bytes = await stream.read(4096)
+            resp = HopMessage()
+            resp.ParseFromString(resp_bytes)
+            if resp.type != HopMessage.STATUS:
+                raise RuntimeError(f"Unexpected relay response type: {resp.type}")
+        finally:
+            await stream.close()
+        relay_addrs = await self._peer_addrs(relay_lib_id)
+        if not relay_addrs:
+            raise RuntimeError("No known address for relay peer")
+        relay_b58 = relay_lib_id.to_base58()
+        return f"{relay_addrs[0]}/p2p/{relay_b58}/p2p-circuit/p2p/{self._host.get_id().to_base58()}"
+
+    async def _relay_dial(self, relay_addr_str: str) -> None:
+        """Dial a peer through a relay; registers the relayed route for later ID-dials."""
+        from libp2p.peer.id import ID as LibID
+
+        if self._relay_transport is None:
+            await self._relay_setup(allow_hop=False)
+        addr = LibMultiaddr(relay_addr_str)
+        await self._relay_transport.dial(addr)
+        dest_b58 = relay_addr_str.rsplit("/p2p/", 1)[-1]
+        dest_id = LibID.from_string(dest_b58) if hasattr(LibID, "from_string") else LibID(dest_b58)
+        try:
+            self._host.get_peerstore().add_addr(dest_id, addr, 3600)
+        except Exception:  # noqa: BLE001 - best effort
+            pass
+        self._remember_addrs(dest_id, [relay_addr_str])
+
+    # -- autonat reachability (trio side) ---------------------------------------
+    async def _autonat_serve(self) -> None:
+        """Answer AutoNAT dial-back requests on this host (idempotent)."""
+        if getattr(self, "_autonat_service", None) is not None:
+            return
+        from libp2p.host.autonat.autonat import AUTONAT_PROTOCOL_ID, AutoNATService
+
+        service = AutoNATService(self._host)
+        self._host.set_stream_handler(AUTONAT_PROTOCOL_ID, service.handle_stream)
+        self._autonat_service = service
+
+    async def _autonat_status(self) -> str:
+        service = getattr(self, "_autonat_service", None)
+        if service is None:
+            return "unknown"
+        try:
+            status = service.get_status()
+        except Exception:  # noqa: BLE001
+            return "unknown"
+        return {0: "unknown", 1: "public", 2: "private"}.get(int(status), "unknown")
+
+    async def _autonat_check(self, server_lib_id, addr_strs: List[str]) -> bool:
+        """Ask a server to dial us back at ``addr_strs``; True if it reached us."""
+        from libp2p.host.autonat.autonat import AUTONAT_PROTOCOL_ID
+        from libp2p.host.autonat.pb.autonat_pb2 import DialResponse, Message, Status, Type
+
+        request = Message(type=Type.DIAL)
+        dial = request.dial
+        self_id = self._host.get_id()
+        entry = dial.peers.add()
+        entry.id = self_id.to_bytes()
+        entry.addrs.extend([a.encode() for a in addr_strs])
+        stream = await self._host.new_stream(server_lib_id, [AUTONAT_PROTOCOL_ID])
+        try:
+            await stream.write(request.SerializeToString())
+            with trio.fail_after(20):
+                response_bytes = await stream.read(65536)
+            response = Message()
+            response.ParseFromString(response_bytes)
+            if response.type != Type.DIAL_RESPONSE:
+                return False
+            dial_resp: DialResponse = response.dial_response
+            if dial_resp.status != Status.OK:
+                return False
+            return any(getattr(p, "success", False) for p in dial_resp.peers)
+        finally:
+            await stream.close()
+
+    # -- dcutr hole punching (trio side) ----------------------------------------
+    async def _dcutr_start(self) -> None:
+        """Run the DCUtR responder on this host (idempotent)."""
+        if getattr(self, "_dcutr", None) is not None:
+            return
+        from libp2p.relay.circuit_v2.dcutr import DCUtRProtocol
+        from libp2p.relay.circuit_v2.dcutr import PROTOCOL_ID as DCUTR_PROTOCOL_ID
+
+        dcutr = DCUtRProtocol(self._host)
+        # Register only the responder; the full Service.run() needs a service
+        # manager, unnecessary for answering hole-punch streams in tests.
+        self._host.set_stream_handler(DCUTR_PROTOCOL_ID, dcutr._handle_dcutr_stream)
+        self._dcutr = dcutr
+
+    async def _dcutr_punch(self, peer_lib_id) -> bool:
+        from libp2p.relay.circuit_v2.dcutr import DCUtRProtocol
+
+        dcutr = getattr(self, "_dcutr", None)
+        if dcutr is None:
+            dcutr = DCUtRProtocol(self._host)
+            self._dcutr = dcutr
+        try:
+            with trio.fail_after(30):
+                return bool(await dcutr.initiate_hole_punch(peer_lib_id))
+        except Exception:  # noqa: BLE001 - punch failed
+            logger.debug("DCUtR hole punch failed:", exc_info=True)
+            return False
 
     # -- lifecycle ----------------------------------------------------------
     def retain(self) -> None:

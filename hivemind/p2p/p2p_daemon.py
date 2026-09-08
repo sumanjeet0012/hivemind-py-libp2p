@@ -171,9 +171,9 @@ class P2P:
         if force_reachability is not None:
             _warn_noop_once("force_reachability", "reachability forcing needs Phase-4 AutoNAT")
         if not auto_nat:
-            _warn_noop_once("auto_nat", "AutoNAT service needs Phase-4 wiring")
+            _warn_noop_once("auto_nat", "disabling the AutoNAT responder is not supported")
         if not use_relay:
-            _warn_noop_once("use_relay", "Circuit Relay v2 needs Phase-4 wiring")
+            _warn_noop_once("use_relay", "use_relay=False disables relay roles; hop/auto-relay tuning is Phase-4 work")
         if use_auto_relay:
             _warn_noop_once("use_auto_relay", "auto-relay needs Phase-4 wiring")
         if not nat_port_map:
@@ -246,6 +246,15 @@ class P2P:
         self._alive = True
         logger.debug(f"Launched native py-libp2p host with peer id = {self.peer_id}")
 
+        if use_relay:
+            # Default STOP|CLIENT roles (accept relayed streams, dial via relays),
+            # mirroring the daemon default. Hop role is opt-in via enable_relay().
+            await self.enable_relay(allow_hop=False)
+
+        if auto_nat:
+            # Answer AutoNAT dial-back requests (reachability service role).
+            await self.enable_autonat()
+
         if initial_peers:
             for addr in initial_peers:
                 with suppress(Exception):
@@ -283,7 +292,7 @@ class P2P:
         if use_auto_relay:
             _warn_noop_once("use_auto_relay", "auto-relay needs Phase-4 wiring")
         if not use_relay:
-            _warn_noop_once("use_relay", "Circuit Relay v2 needs Phase-4 wiring")
+            _warn_noop_once("use_relay", "use_relay=False disables relay roles; hop/auto-relay tuning is Phase-4 work")
         with open(identity_path, "rb") as f:
             peer_id = PeerID.from_identity(f.read())
 
@@ -771,6 +780,82 @@ class P2P:
                 raise P2PDaemonError(f"Failed to open stream for `{handler_name}` at {peer_id}: {e}") from e
         except Exception as e:  # noqa: BLE001 - bridge failures surface as daemon errors
             raise P2PDaemonError(f"Failed to open stream for `{handler_name}` at {peer_id}: {e}") from e
+
+    # -- circuit relay v2 -----------------------------------------------------
+    async def enable_relay(self, allow_hop: bool = False) -> None:
+        """
+        Enable Circuit Relay v2 roles on this peer.
+
+        :param allow_hop: also act as a relay point for others (hop role).
+        """
+        if self._gateway is None:
+            raise P2PDaemonError("P2P instance is shut down")
+        await self._gateway.run(self._gateway._relay_setup, allow_hop)
+
+    async def reserve_relay_slot(self, relay_peer: PeerID) -> str:
+        """
+        Reserve a slot on a relay point. Returns our relay address
+        (``/p2p/<relay>/p2p-circuit/p2p/<self>``) for others to dial us through it.
+        """
+        await self._ensure_connected(relay_peer)
+        gateway = self._gateway
+        return await gateway.run(gateway._relay_reserve, hivemind_id_to_libp2p(relay_peer))
+
+    async def dial_via_relay(self, relay_addr: str) -> None:
+        """Dial a peer through a relay address (``.../p2p-circuit/p2p/<peer>``)."""
+        if self._gateway is None:
+            raise P2PDaemonError("P2P instance is shut down")
+        try:
+            await self._gateway.run(self._gateway._relay_dial, relay_addr)
+        except Exception as e:  # noqa: BLE001 - mirror daemon error style
+            raise P2PDaemonError(f"Failed to dial via relay {relay_addr}: {e}") from e
+
+    async def relay_has_reservation(self, peer_id: PeerID) -> bool:
+        """Check whether this (relay) peer holds a reservation for ``peer_id``."""
+        if self._gateway is None:
+            return False
+        return await self._gateway.run(
+            self._gateway._relay_has_reservation, hivemind_id_to_libp2p(peer_id)
+        )
+
+    # -- autonat reachability ---------------------------------------------------
+    async def enable_autonat(self) -> None:
+        """Answer AutoNAT dial-back requests on this peer (idempotent)."""
+        if self._gateway is None:
+            raise P2PDaemonError("P2P instance is shut down")
+        await self._gateway.run(self._gateway._autonat_serve)
+
+    async def autonat_status(self) -> str:
+        """This peer's last-known reachability: unknown/public/private."""
+        if self._gateway is None:
+            return "unknown"
+        return await self._gateway.run(self._gateway._autonat_status)
+
+    async def autonat_check(self, server_peer: PeerID, addrs: Optional[List[str]] = None) -> bool:
+        """
+        Ask ``server_peer`` to dial us back (AutoNAT). Returns True if the
+        server reached us at one of ``addrs`` (default: our visible addrs).
+        """
+        await self._ensure_connected(server_peer)
+        gateway = self._gateway
+        if addrs is None:
+            addrs = [str(a).split("/p2p/")[0] for a in await self.get_visible_maddrs()]
+        return await gateway.run(
+            gateway._autonat_check, hivemind_id_to_libp2p(server_peer), addrs
+        )
+
+    # -- dcutr hole punching ------------------------------------------------------
+    async def enable_dcutr(self) -> None:
+        """Run the DCUtR responder on this peer (idempotent)."""
+        if self._gateway is None:
+            raise P2PDaemonError("P2P instance is shut down")
+        await self._gateway.run(self._gateway._dcutr_start)
+
+    async def hole_punch(self, peer_id: PeerID) -> bool:
+        """Attempt a DCUtR hole punch to ``peer_id`` (True on direct path)."""
+        await self._ensure_connected(peer_id)
+        gateway = self._gateway
+        return await gateway.run(gateway._dcutr_punch, hivemind_id_to_libp2p(peer_id))
 
     def __del__(self):
         try:
