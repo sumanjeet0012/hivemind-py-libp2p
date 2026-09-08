@@ -147,6 +147,7 @@ class TrioGateway:
         # The peerstore may drop addresses on disconnect; this cache keeps
         # redial working for previously seen peers (e.g. DHT routing entries).
         self._known_addrs: Dict[str, List[str]] = {}
+        self._rendezvous_service = None
         self._refcount = 0
         self._lock = threading.Lock()
         self._loop: Optional[asyncio.AbstractEventLoop] = None
@@ -291,6 +292,50 @@ class TrioGateway:
             await stream.close()
         except Exception:  # noqa: BLE001 - already closed
             pass
+
+    # -- rendezvous (trio side; asyncio facades go through P2P methods) -------
+    async def _rendezvous_service_start(self) -> None:
+        """Host a rendezvous point on this host (idempotent)."""
+        if self._rendezvous_service is None:
+            from libp2p.discovery.rendezvous.service import RendezvousService
+
+            self._rendezvous_service = RendezvousService(self._host)
+
+    async def _rendezvous_register(self, rendezvous_lib_id, namespace: str, ttl: int) -> float:
+        from libp2p.discovery.rendezvous.client import RendezvousClient
+
+        client = RendezvousClient(self._host, rendezvous_lib_id)
+        try:
+            return await client.register(namespace, ttl)
+        finally:
+            await client.close()
+
+    async def _rendezvous_unregister(self, rendezvous_lib_id, namespace: str) -> None:
+        from libp2p.discovery.rendezvous.client import RendezvousClient
+
+        client = RendezvousClient(self._host, rendezvous_lib_id)
+        try:
+            await client.unregister(namespace)
+        finally:
+            await client.close()
+
+    async def _rendezvous_discover(
+        self, rendezvous_lib_id, namespace: str, limit: int
+    ) -> List[Tuple[str, List[str]]]:
+        """Discover peers; returns plain [(peer_id_b58, [addr_str])] + feeds dial cache."""
+        from libp2p.discovery.rendezvous.client import RendezvousClient
+
+        client = RendezvousClient(self._host, rendezvous_lib_id)
+        try:
+            peers, _cookie = await client.discover(namespace, limit=limit)
+        finally:
+            await client.close()
+        out = []
+        for peer in peers:
+            addr_strs = [str(a) for a in peer.addrs]
+            self._remember_addrs(peer.peer_id, addr_strs)
+            out.append((peer.peer_id.to_base58(), addr_strs))
+        return out
 
     # -- duplex byte pipe ---------------------------------------------------
     # Teardown model (drain-safe):

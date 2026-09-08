@@ -778,6 +778,47 @@ class P2P:
         except Exception:  # noqa: BLE001 - never raise from __del__
             pass
 
+    # -- rendezvous discovery -------------------------------------------------
+    async def start_rendezvous_server(self) -> None:
+        """Host a rendezvous point on this peer (idempotent)."""
+        if self._gateway is None:
+            raise P2PDaemonError("P2P instance is shut down")
+        await self._gateway.run(self._gateway._rendezvous_service_start)
+
+    async def rendezvous_register(self, namespace: str, rendezvous_peer: PeerID, ttl: int = 7200) -> float:
+        """
+        Register this peer under ``namespace`` at a rendezvous point.
+
+        :returns: actual TTL granted by the server.
+        """
+        await self._ensure_connected(rendezvous_peer)
+        gateway = self._gateway
+        return await gateway.run(
+            gateway._rendezvous_register, hivemind_id_to_libp2p(rendezvous_peer), namespace, ttl
+        )
+
+    async def rendezvous_unregister(self, namespace: str, rendezvous_peer: PeerID) -> None:
+        await self._ensure_connected(rendezvous_peer)
+        gateway = self._gateway
+        await gateway.run(gateway._rendezvous_unregister, hivemind_id_to_libp2p(rendezvous_peer), namespace)
+
+    async def rendezvous_discover(
+        self, namespace: str, rendezvous_peer: PeerID, limit: int = 100
+    ) -> List[PeerInfo]:
+        """
+        Discover peers registered under ``namespace``. Discovered addresses are
+        cached, so the returned peers are directly dialable afterwards.
+        """
+        await self._ensure_connected(rendezvous_peer)
+        gateway = self._gateway
+        found = await gateway.run(
+            gateway._rendezvous_discover, hivemind_id_to_libp2p(rendezvous_peer), namespace, limit
+        )
+        return [
+            PeerInfo(PeerID.from_base58(peer_b58), [Multiaddr(a) for a in addr_strs])
+            for peer_b58, addr_strs in found
+        ]
+
     @property
     def is_alive(self) -> bool:
         return self._alive
