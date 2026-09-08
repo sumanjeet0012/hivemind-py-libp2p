@@ -40,6 +40,26 @@ class P2PContext:
 # Replaces the old "connect to an already running p2pd" mechanism.
 _SHARED_GATEWAYS: dict = {}
 
+# Params accepted for backward compatibility but not yet wired to py-libp2p
+# (Rendezvous / NAT traversal land in Phases 3-4). Each is warned about once
+# per process when explicitly set to a non-default value.
+_NOOP_WARNED: set = set()
+
+
+def _warn_noop_once(name: str, detail: str) -> None:
+    if name not in _NOOP_WARNED:
+        _NOOP_WARNED.add(name)
+        warnings.warn(
+            f"hivemind.P2P parameter `{name}` is accepted for backward compatibility "
+            f"but has no effect in the native py-libp2p backend yet ({detail}).",
+            UserWarning,
+            stacklevel=3,
+        )
+
+
+def _warn_balanced_once() -> None:
+    _warn_noop_once("balanced", "single in-process host needs no cross-handler balancing")
+
 
 def _proto(name: str) -> str:
     """Single wire namespace for unary, streaming and raw binary handlers.
@@ -115,10 +135,14 @@ class P2P:
         """
         Start an in-process native py-libp2p host and connect to the swarm.
 
-        Daemon-only transport flags (``auto_nat``, ``conn_manager``, ``use_relay``,
-        ``nat_port_map``, ...) are accepted for signature compatibility and wired
-        up in later phases (Rendezvous / NAT traversal); they currently have no
-        effect beyond being validated.
+        Parameter mapping onto py-libp2p: ``host_maddrs`` → listen addrs (TCP/QUIC
+        auto-detected), ``announce_maddrs`` → announced addrs, ``identity_path`` →
+        RSA keypair, ``tls`` → Noise+TLS (default) or Noise-only, ``conn_manager`` →
+        default connection manager, ``startup_timeout`` → host ready timeout,
+        ``no_listen`` → no listen addrs. The remaining transport/discovery flags
+        (``auto_nat``, ``use_relay``, ``dht_mode``, …) are accepted for signature
+        compatibility and warn once when set to non-default values; they are
+        wired up in later phases (Rendezvous / NAT traversal).
         """
         assert not (initial_peers and use_ipfs), (
             "User-defined initial_peers and use_ipfs=True are incompatible, please choose one option"
@@ -137,6 +161,34 @@ class P2P:
             raise ValueError(f"Unknown dht_mode {dht_mode!r}, expected one of {sorted(cls.DHT_MODE_MAPPING)}")
         if force_reachability is not None and force_reachability not in cls.FORCE_REACHABILITY_MAPPING:
             raise ValueError(f"Unknown force_reachability {force_reachability!r}")
+
+        # Honest no-ops: warn once per process when explicitly set off-default.
+        if dht_mode != "server":
+            _warn_noop_once("dht_mode", "Kademlia mode selection needs Phase-3 discovery")
+        if force_reachability is not None:
+            _warn_noop_once("force_reachability", "reachability forcing needs Phase-4 AutoNAT")
+        if not auto_nat:
+            _warn_noop_once("auto_nat", "AutoNAT service needs Phase-4 wiring")
+        if not use_relay:
+            _warn_noop_once("use_relay", "Circuit Relay v2 needs Phase-4 wiring")
+        if use_auto_relay:
+            _warn_noop_once("use_auto_relay", "auto-relay needs Phase-4 wiring")
+        if not nat_port_map:
+            _warn_noop_once("nat_port_map", "port mapping needs Phase-4 wiring")
+        if relay_hop_limit:
+            _warn_noop_once("relay_hop_limit", "relay limits need Phase-4 wiring")
+        if trusted_relays is not None:
+            _warn_noop_once("trusted_relays", "relay selection needs Phase-4 wiring")
+        if not conn_manager:
+            _warn_noop_once(
+                "conn_manager", "the swarm always runs its default connection manager"
+            )
+        if idle_timeout != 30:
+            _warn_noop_once("idle_timeout", "no persistent-conn sweeps in the native backend")
+        if persistent_conn_max_msg_size != DEFAULT_MAX_MSG_SIZE:
+            _warn_noop_once(
+                "persistent_conn_max_msg_size", "native streams frame per message without this cap"
+            )
 
         self = cls()
         if announce_maddrs is not None:
@@ -158,7 +210,17 @@ class P2P:
             key_pair = cls._load_keypair(identity_path)
 
         listen_maddrs = [] if no_listen else [str(a) for a in (host_maddrs or [])]
-        gateway = TrioGateway(key_pair=key_pair, listen_maddrs=listen_maddrs)
+        announce_addrs = None
+        if announce_maddrs is not None:
+            announce_addrs = [str(Multiaddr(a)) for a in announce_maddrs]
+        gateway = TrioGateway(
+            key_pair=key_pair,
+            listen_maddrs=listen_maddrs,
+            startup_timeout=startup_timeout,
+            security="default" if tls else "noise-only",
+            connection_config=None,  # swarm default connection manager
+            announce_addrs=announce_addrs,
+        )
         gateway.attach_loop(asyncio.get_running_loop())
         gateway.retain()
         self._gateway = gateway
@@ -170,11 +232,8 @@ class P2P:
         lib_id = await gateway.run(gateway._get_id)
         self.peer_id = libp2p_id_to_hivemind(lib_id)
 
-        if announce_maddrs is not None:
-            self._visible_maddrs = [Multiaddr(a) for a in announce_maddrs]
-        else:
-            raw = await gateway.run(gateway._get_addrs)
-            self._visible_maddrs = [libp2p_maddr_to_hivemind(a) for a in raw]
+        raw = await gateway.run(gateway._get_addrs)
+        self._visible_maddrs = [libp2p_maddr_to_hivemind(a) for a in raw]
         p2p_suffix = Multiaddr(f"/p2p/{self.peer_id.to_base58()}")
         self._visible_maddrs = [a.encapsulate(p2p_suffix) if "p2p" not in a else a for a in self._visible_maddrs]
 
@@ -480,6 +539,8 @@ class P2P:
         # Like the Go daemon, unary and streaming handlers share one namespace:
         # every protobuf handler is served by the streaming engine, with unary
         # calls mapped onto a single request/response exchange.
+        if balanced:
+            _warn_balanced_once()
         async def _stream_handler(requests: P2P.TInputStream, context: P2PContext) -> P2P.TOutputStream:
             input = requests if stream_input else await asingle(requests)
             output = handler(input, context)
@@ -557,6 +618,8 @@ class P2P:
     async def add_binary_stream_handler(
         self, name: str, handler, balanced: bool = False
     ) -> None:
+        if balanced:
+            _warn_balanced_once()
         name = _proto(name)
         gateway = self._gateway
         if gateway is None:

@@ -30,7 +30,7 @@ import libp2p.crypto.pb.crypto_pb2 as _libp2p_crypto_pb2
 sys.modules.setdefault("hivemind.proto.crypto_pb2", _libp2p_crypto_pb2)
 
 import trio
-from libp2p import new_host
+from libp2p import generate_new_ed25519_identity, new_host
 from libp2p.crypto.keys import KeyPair
 from multiaddr import Multiaddr as LibMultiaddr
 
@@ -118,9 +118,22 @@ class _StreamSession:
 class TrioGateway:
     """Owns one trio event loop + one libp2p host shared by N asyncio facades."""
 
-    def __init__(self, key_pair: Optional[KeyPair], listen_maddrs: List[str]):
+    def __init__(
+        self,
+        key_pair: Optional[KeyPair],
+        listen_maddrs: List[str],
+        *,
+        startup_timeout: float = 15.0,
+        security: str = "default",
+        connection_config=None,
+        announce_addrs: Optional[List[str]] = None,
+    ):
         self._key_pair = key_pair
         self._listen_maddrs = listen_maddrs
+        self._startup_timeout = startup_timeout
+        self._security = security
+        self._connection_config = connection_config
+        self._announce_addrs = announce_addrs
         self._ready = threading.Event()
         self._init_error: Optional[BaseException] = None
         self._trio_token = None
@@ -138,8 +151,10 @@ class TrioGateway:
         self._spawn_send = None
         self._thread = threading.Thread(target=self._run, daemon=True, name="hivemind-trio-gateway")
         self._thread.start()
-        if not self._ready.wait(timeout=30.0):
-            raise P2PDaemonError("Native py-libp2p host failed to start within 30 seconds")
+        if not self._ready.wait(timeout=self._startup_timeout):
+            raise P2PDaemonError(
+                f"Native py-libp2p host failed to start within {self._startup_timeout} seconds"
+            )
         if self._init_error is not None:
             raise self._init_error
 
@@ -162,7 +177,23 @@ class TrioGateway:
             trio.to_thread.current_default_thread_limiter().total_tokens = 256
         except Exception:  # noqa: BLE001 - best effort
             pass
-        self._host = new_host(key_pair=self._key_pair)
+        key_pair = self._key_pair or generate_new_ed25519_identity()
+        sec_opt = None
+        if self._security == "noise-only":
+            from libp2p.crypto.x25519 import create_new_key_pair as create_new_x25519_key_pair
+            from libp2p.security.noise.transport import PROTOCOL_ID as NOISE_PROTOCOL_ID
+            from libp2p.security.noise.transport import Transport as NoiseTransport
+
+            noise_kp = create_new_x25519_key_pair()
+            sec_opt = {
+                NOISE_PROTOCOL_ID: NoiseTransport(key_pair, noise_privkey=noise_kp.private_key),
+            }
+        self._host = new_host(
+            key_pair=key_pair,
+            sec_opt=sec_opt,
+            connection_config=self._connection_config,
+            announce_addrs=[LibMultiaddr(a) for a in self._announce_addrs] if self._announce_addrs else None,
+        )
         addrs = [LibMultiaddr(a) for a in self._listen_maddrs]
         send, recv = trio.open_memory_channel(1024)
         self._spawn_send = send
