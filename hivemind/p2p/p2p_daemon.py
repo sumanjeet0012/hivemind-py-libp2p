@@ -12,6 +12,7 @@ from google.protobuf.message import Message
 
 from hivemind.p2p.p2p_native import (  # noqa: E402 - first: installs crypto_pb2 alias
     TrioGateway,
+    _READER_LIMIT,
     hivemind_id_to_libp2p,
     hivemind_maddr_to_libp2p,
     libp2p_id_to_hivemind,
@@ -139,7 +140,9 @@ class P2P:
         auto-detected), ``announce_maddrs`` → announced addrs, ``identity_path`` →
         RSA keypair, ``tls`` → Noise+TLS (default) or Noise-only, ``conn_manager`` →
         default connection manager, ``startup_timeout`` → host ready timeout,
-        ``no_listen`` → no listen addrs. The remaining transport/discovery flags
+        ``persistent_conn_max_msg_size`` → inbound stream buffer cap (when set),
+        ``no_listen`` → no listen addrs, ``persistent_conn_max_msg_size`` → inbound
+        stream buffer cap when explicitly set. The remaining transport/discovery flags
         (``auto_nat``, ``use_relay``, ``dht_mode``, …) are accepted for signature
         compatibility and warn once when set to non-default values; they are
         wired up in later phases (Rendezvous / NAT traversal).
@@ -185,10 +188,6 @@ class P2P:
             )
         if idle_timeout != 30:
             _warn_noop_once("idle_timeout", "no persistent-conn sweeps in the native backend")
-        if persistent_conn_max_msg_size != DEFAULT_MAX_MSG_SIZE:
-            _warn_noop_once(
-                "persistent_conn_max_msg_size", "native streams frame per message without this cap"
-            )
 
         self = cls()
         if announce_maddrs is not None:
@@ -220,6 +219,13 @@ class P2P:
             security="default" if tls else "noise-only",
             connection_config=None,  # swarm default connection manager
             announce_addrs=announce_addrs,
+            # The daemon capped persistent-conn frames at this size; natively it
+            # bounds inbound stream buffering. Default (4MB) keeps the generous
+            # 64MB native buffer; an explicit value is honored literally.
+            reader_limit=(
+                _READER_LIMIT if persistent_conn_max_msg_size == DEFAULT_MAX_MSG_SIZE
+                else persistent_conn_max_msg_size
+            ),
         )
         gateway.attach_loop(asyncio.get_running_loop())
         gateway.retain()
@@ -263,12 +269,25 @@ class P2P:
 
     @classmethod
     async def is_identity_taken(
-        cls, identity_path: str, *, initial_peers: Optional[Sequence[Union[Multiaddr, str]]] = None, **kwargs
+        cls,
+        identity_path: str,
+        *,
+        initial_peers: Optional[Sequence[Union[Multiaddr, str]]] = None,
+        tls: bool = True,
+        use_auto_relay: bool = False,
+        use_ipfs: bool = False,
+        use_relay: bool = True,
     ) -> bool:
+        if use_ipfs:
+            raise P2PDaemonError("use_ipfs is not supported by the native py-libp2p backend")
+        if use_auto_relay:
+            _warn_noop_once("use_auto_relay", "auto-relay needs Phase-4 wiring")
+        if not use_relay:
+            _warn_noop_once("use_relay", "Circuit Relay v2 needs Phase-4 wiring")
         with open(identity_path, "rb") as f:
             peer_id = PeerID.from_identity(f.read())
 
-        anonymous = await cls.create(initial_peers=initial_peers, check_if_identity_free=False)
+        anonymous = await cls.create(initial_peers=initial_peers, check_if_identity_free=False, tls=tls)
         try:
             for _ in range(50):
                 peers = await anonymous.list_peers()
@@ -359,6 +378,20 @@ class P2P:
         return self._daemon_listen_maddr
 
     async def get_visible_maddrs(self, latest: bool = False) -> List[Multiaddr]:
+        """
+        Get multiaddrs of the current peer that should be accessible by other peers.
+
+        :param latest: re-read the addresses from the live host instead of the
+                       cached snapshot taken at startup.
+        """
+        if latest and self._gateway is not None:
+            raw = await self._gateway.run(self._gateway._get_addrs)
+            p2p_suffix = Multiaddr(f"/p2p/{self.peer_id.to_base58()}")
+            self._visible_maddrs = []
+            for a in raw:
+                ha = libp2p_maddr_to_hivemind(a)
+                self._visible_maddrs.append(ha.encapsulate(p2p_suffix) if "p2p" not in ha else ha)
+
         if not self._visible_maddrs:
             raise ValueError(f"No multiaddrs found for peer {self.peer_id}")
         return list(self._visible_maddrs)
@@ -489,7 +522,7 @@ class P2P:
                 finally:
                     processing_task.cancel()
 
-        await self.add_binary_stream_handler(_proto(name), _handle_stream)
+        await self.add_binary_stream_handler(_proto(name), _handle_stream, balanced=balanced)
 
     async def _iterate_protobuf_stream_handler(
         self, peer_id: PeerID, name: str, requests: TInputStream, output_protobuf_type: Type[Message]

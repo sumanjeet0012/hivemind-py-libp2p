@@ -127,6 +127,7 @@ class TrioGateway:
         security: str = "default",
         connection_config=None,
         announce_addrs: Optional[List[str]] = None,
+        reader_limit: int = _READER_LIMIT,
     ):
         self._key_pair = key_pair
         self._listen_maddrs = listen_maddrs
@@ -134,6 +135,7 @@ class TrioGateway:
         self._security = security
         self._connection_config = connection_config
         self._announce_addrs = announce_addrs
+        self._reader_limit = reader_limit
         self._ready = threading.Event()
         self._init_error: Optional[BaseException] = None
         self._trio_token = None
@@ -299,7 +301,7 @@ class TrioGateway:
     def open_pipe(self, loop=None) -> Tuple[asyncio.StreamReader, _AsyncioWriter, "std_queue.Queue[Optional[bytes]]", str]:
         """Create an asyncio (reader, writer) pair bridged to trio via queues."""
         loop = loop or self._loop or asyncio.get_running_loop()
-        reader = asyncio.StreamReader(limit=_READER_LIMIT, loop=loop)
+        reader = asyncio.StreamReader(limit=self._reader_limit, loop=loop)
         out_queue: "std_queue.Queue[Optional[bytes]]" = std_queue.Queue()
         session_id = secrets.token_hex(8)
         self._sessions[session_id] = _StreamSession(loop=loop, done=threading.Event())
