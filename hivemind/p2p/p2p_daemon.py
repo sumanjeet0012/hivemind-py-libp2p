@@ -605,6 +605,7 @@ class P2P:
         await gateway.run(_set)
 
     async def remove_binary_stream_handler(self, name: str) -> None:
+        name = _proto(name)
         if name not in self._stream_handlers:
             raise P2PDaemonError(f"Handler `{name}` is not registered")
         del self._stream_handlers[name]
