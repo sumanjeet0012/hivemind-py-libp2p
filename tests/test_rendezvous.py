@@ -97,3 +97,29 @@ async def test_namespace_isolation(rendezvous_point, two_peers):
 
     await peer_a.rendezvous_register(f"{NS}-one", point_id, ttl=TTL)
     assert await peer_b.rendezvous_discover(f"{NS}-other", point_id) == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.slow
+async def test_registration_expires_after_ttl(rendezvous_point):
+    """Real TTL expiry: register with the 120s minimum, poll until gone."""
+    import asyncio
+
+    maddrs = await rendezvous_point.get_visible_maddrs()
+    point_id = rendezvous_point.peer_id
+    peer = await P2P.create(initial_peers=maddrs)
+    try:
+        ns = f"{NS}-expiry"
+        await peer.rendezvous_register(ns, point_id, ttl=120)
+        assert any(p.peer_id == peer.peer_id for p in await peer.rendezvous_discover(ns, point_id))
+
+        gone = False
+        for _ in range(18):  # up to ~3 min
+            await asyncio.sleep(10)
+            found = await peer.rendezvous_discover(ns, point_id)
+            if all(p.peer_id != peer.peer_id for p in found):
+                gone = True
+                break
+        assert gone, "registration did not expire after its TTL"
+    finally:
+        await peer.shutdown()
